@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+common:
+  tags:
+    - net
+    - socket
+    - tls
+    - poll
+  platform_allow:
+    - native_sim/native/64
+  integration_platforms:
+    - native_sim/native/64
+  harness: pytest
+  timeout: 60
+tests:
+  net.socket.tls.poll.nsos: {}

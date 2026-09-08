@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+common:
+  tags:
+    - net
+    - socket
+    - poll
+  integration_platforms:
+    - native_sim/native/64
+tests:
+  net.socket.poll.retry: {}
+  net.socket.poll.retry.nsos:
+    platform_allow:
+      - native_sim/native/64
+    extra_configs:
+      - CONFIG_NET_LOOPBACK=n
+      - CONFIG_ETH_NATIVE_TAP=n
+      - CONFIG_NET_SOCKETS_OFFLOAD=y
+      - CONFIG_NET_NATIVE_OFFLOADED_SOCKETS=y
