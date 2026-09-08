@@ -35,77 +35,80 @@ int zvfs_poll_internal(struct zvfs_pollfd *fds, int nfds, k_timeout_t timeout)
 
 	end = sys_timepoint_calc(timeout);
 
-	pev = poll_events;
-	for (pfd = fds, i = nfds; i--; pfd++) {
-		void *ctx;
-		int result;
+	do {
+		bool no_wait = false;
 
-		/* Per POSIX, negative fd's are just ignored */
-		if (pfd->fd < 0) {
-			continue;
-		}
+		/* Updates may consume readiness and release backend registrations. */
+		pev = poll_events;
+		for (pfd = fds, i = nfds; i--; pfd++) {
+			void *ctx;
+			int result;
 
-		ctx = zvfs_get_fd_obj_and_vtable(pfd->fd, &vtable, &lock);
-		if (ctx == NULL) {
-			/* Will set POLLNVAL in return loop */
-			continue;
-		}
-
-		(void)k_mutex_lock(lock, K_FOREVER);
-
-		result = zvfs_fdtable_call_ioctl(vtable, ctx, ZFD_IOCTL_POLL_PREPARE, pfd, &pev,
-						 pev_end);
-		if (result == -EALREADY) {
-			/* If POLL_PREPARE returned with EALREADY, it means
-			 * it already detected that some socket is ready. In
-			 * this case, we still perform a k_poll to pick up
-			 * as many events as possible, but without any wait.
-			 */
-			timeout = K_NO_WAIT;
-			end = sys_timepoint_calc(timeout);
-			result = 0;
-		} else if (result == -EXDEV) {
-			/* If POLL_PREPARE returned EXDEV, it means
-			 * it detected an offloaded socket.
-			 * If offloaded socket is used with native TLS, the TLS
-			 * wrapper for the offloaded poll will be used.
-			 * In case the fds array contains a mixup of offloaded
-			 * and non-offloaded sockets, the offloaded poll handler
-			 * shall return an error.
-			 */
-			offload = true;
-			if (offl_vtable == NULL || net_socket_is_tls(ctx)) {
-				offl_vtable = vtable;
-				offl_ctx = ctx;
+			/* Per POSIX, negative fd's are just ignored */
+			if (pfd->fd < 0) {
+				continue;
 			}
 
-			result = 0;
+			ctx = zvfs_get_fd_obj_and_vtable(pfd->fd, &vtable, &lock);
+			if (ctx == NULL) {
+				/* Will set POLLNVAL in return loop */
+				continue;
+			}
+
+			(void)k_mutex_lock(lock, K_FOREVER);
+
+			result = zvfs_fdtable_call_ioctl(vtable, ctx, ZFD_IOCTL_POLL_PREPARE, pfd,
+							 &pev, pev_end);
+			if (result == -EALREADY) {
+				/* If POLL_PREPARE returned with EALREADY, it means
+				 * it already detected that some socket is ready. In
+				 * this case, we still perform a k_poll to pick up
+				 * as many events as possible, but without any wait.
+				 */
+				no_wait = true;
+				result = 0;
+			} else if (result == -EXDEV) {
+				/* If POLL_PREPARE returned EXDEV, it means
+				 * it detected an offloaded socket.
+				 * If offloaded socket is used with native TLS, the TLS
+				 * wrapper for the offloaded poll will be used.
+				 * In case the fds array contains a mixup of offloaded
+				 * and non-offloaded sockets, the offloaded poll handler
+				 * shall return an error.
+				 */
+				offload = true;
+				if (offl_vtable == NULL || net_socket_is_tls(ctx)) {
+					offl_vtable = vtable;
+					offl_ctx = ctx;
+				}
+
+				result = 0;
+			}
+
+			k_mutex_unlock(lock);
+
+			if (result < 0) {
+				errno = -result;
+				return -1;
+			}
 		}
 
-		k_mutex_unlock(lock);
+		timeout = no_wait ? K_NO_WAIT : sys_timepoint_timeout(end);
 
-		if (result < 0) {
-			errno = -result;
-			return -1;
+		if (offload) {
+			int poll_timeout;
+
+			if (K_TIMEOUT_EQ(timeout, K_FOREVER)) {
+				poll_timeout = SYS_FOREVER_MS;
+			} else {
+				poll_timeout = k_ticks_to_ms_floor32(timeout.ticks);
+			}
+
+			return zvfs_fdtable_call_ioctl(offl_vtable, offl_ctx,
+						       ZFD_IOCTL_POLL_OFFLOAD, fds, nfds,
+						       poll_timeout);
 		}
-	}
 
-	if (offload) {
-		int poll_timeout;
-
-		if (K_TIMEOUT_EQ(timeout, K_FOREVER)) {
-			poll_timeout = SYS_FOREVER_MS;
-		} else {
-			poll_timeout = k_ticks_to_ms_floor32(timeout.ticks);
-		}
-
-		return zvfs_fdtable_call_ioctl(offl_vtable, offl_ctx, ZFD_IOCTL_POLL_OFFLOAD, fds,
-					       nfds, poll_timeout);
-	}
-
-	timeout = sys_timepoint_timeout(end);
-
-	do {
 		ret = k_poll(poll_events, pev - poll_events, timeout);
 		/* EAGAIN when timeout expired, EINTR when cancelled (i.e. EOF) */
 		if (ret != 0 && ret != -EAGAIN && ret != -EINTR) {

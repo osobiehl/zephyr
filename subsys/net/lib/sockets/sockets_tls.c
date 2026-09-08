@@ -4453,6 +4453,7 @@ static int ztls_poll_update_ctx(struct tls_context *ctx,
 	void *obj;
 	int ret;
 	short events = pfd->events;
+	bool handshake_ready = false;
 
 	obj = zvfs_get_fd_obj_and_vtable(
 		ctx->sock, (const struct fd_op_vtable **)&vtable, &lock);
@@ -4465,27 +4466,13 @@ static int ztls_poll_update_ctx(struct tls_context *ctx,
 	/* Check if the socket was waiting for the handshake to complete. */
 	if ((pfd->events & ZSOCK_POLLIN) &&
 	    ((*pev)->obj == &ctx->active_session->tls_established)) {
-		/* In case handshake is complete, reconfigure the k_poll_event
-		 * to monitor the underlying socket now.
+		/* Finish updating the events prepared while waiting for the
+		 * handshake. The next poll iteration prepares socket events.
 		 */
-		if ((*pev)->state != K_POLL_STATE_NOT_READY) {
-			ret = zvfs_fdtable_call_ioctl(vtable, obj,
-						   ZFD_IOCTL_POLL_PREPARE,
-						   pfd, pev, *pev + 1);
-			if (ret != 0 && ret != -EALREADY) {
-				goto out;
-			}
+		handshake_ready = (*pev)->state != K_POLL_STATE_NOT_READY;
 
-			/* Return -EAGAIN to signal to poll() that it should
-			 * make another iteration with the event reconfigured
-			 * above (if needed).
-			 */
-			ret = -EAGAIN;
-			goto out;
-		}
-
-		/* Handshake still not ready - skip ZSOCK_POLLIN verification
-		 * for the underlying socket.
+		/* POLLIN was not prepared for the underlying socket. Skip its
+		 * verification until the next poll iteration.
 		 */
 		(*pev)++;
 		pfd->events &= ~ZSOCK_POLLIN;
@@ -4494,6 +4481,11 @@ static int ztls_poll_update_ctx(struct tls_context *ctx,
 	ret = zvfs_fdtable_call_ioctl(vtable, obj, ZFD_IOCTL_POLL_UPDATE,
 				   pfd, pev);
 	if (ret != 0) {
+		goto exit;
+	}
+
+	if (handshake_ready && pfd->revents == 0) {
+		ret = -EAGAIN;
 		goto exit;
 	}
 
@@ -4510,7 +4502,6 @@ exit:
 	/* Restore original events. */
 	pfd->events = events;
 
-out:
 	k_mutex_unlock(lock);
 
 	return ret;
