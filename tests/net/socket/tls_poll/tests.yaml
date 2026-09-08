@@ -15,3 +15,13 @@ common:
   timeout: 60
 tests:
   net.socket.tls.poll.nsos: {}
+  net.socket.tls.poll.client_native:
+    harness: console
+    harness_config:
+      type: one_line
+      regex:
+        - CLIENT_HANDSHAKE_OK
+    extra_configs:
+      - CONFIG_NET_SOCKETS_OFFLOAD=n
+      - CONFIG_NET_NATIVE_OFFLOADED_SOCKETS=n
+      - CONFIG_NET_LOOPBACK=y

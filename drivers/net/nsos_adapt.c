@@ -938,7 +938,7 @@ void nsos_adapt_poll_add(struct nsos_mid_pollfd *pollfd)
 {
 	struct epoll_event ev = {
 		.data.ptr = pollfd,
-		.events = nsos_poll_to_epoll_events(pollfd->events),
+		.events = nsos_poll_to_epoll_events(pollfd->events) | EPOLLONESHOT,
 	};
 	int err;
 

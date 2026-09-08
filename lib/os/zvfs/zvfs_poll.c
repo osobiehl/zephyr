@@ -62,7 +62,6 @@ int zvfs_poll_internal(struct zvfs_pollfd *fds, int nfds, k_timeout_t timeout)
 			 * as many events as possible, but without any wait.
 			 */
 			timeout = K_NO_WAIT;
-			end = sys_timepoint_calc(timeout);
 			result = 0;
 		} else if (result == -EXDEV) {
 			/* If POLL_PREPARE returned EXDEV, it means
@@ -103,7 +102,9 @@ int zvfs_poll_internal(struct zvfs_pollfd *fds, int nfds, k_timeout_t timeout)
 					       nfds, poll_timeout);
 	}
 
-	timeout = sys_timepoint_timeout(end);
+	if (!K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
+		timeout = sys_timepoint_timeout(end);
+	}
 
 	do {
 		ret = k_poll(poll_events, pev - poll_events, timeout);

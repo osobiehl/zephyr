@@ -279,6 +279,15 @@ static int nsos_close(void *obj)
 	k_spinlock_key_t key;
 	int ret;
 
+	key = k_spin_lock(&nsos_polls_lock);
+	if (sys_dnode_is_linked(&sock->poll.node)) {
+		sock->poll.mid.revents = ZSOCK_POLLHUP;
+		sock->poll.mid.cb(&sock->poll.mid);
+		nsos_adapt_poll_remove(&sock->poll.mid);
+		sys_dlist_remove(&sock->poll.node);
+	}
+	k_spin_unlock(&nsos_polls_lock, key);
+
 	ret = nsi_host_close(sock->poll.mid.fd);
 	if (ret < 0) {
 		errno = nsos_adapt_get_zephyr_errno();
@@ -323,37 +332,28 @@ static int nsos_poll_prepare(struct nsos_socket *sock, struct zsock_pollfd *pfd,
 	k_spinlock_key_t key;
 	int flags;
 
-	poll->mid.events = pfd->events;
-	poll->mid.revents = 0;
-	poll->mid.cb = pollcb;
-
 	if (*pev == pev_end) {
 		return -ENOMEM;
 	}
 
-	k_poll_signal_init(&poll->signal);
-	k_poll_event_init(*pev, K_POLL_TYPE_SIGNAL, K_POLL_MODE_NOTIFY_ONLY, &poll->signal);
 	key = k_spin_lock(&nsos_polls_lock);
-
-	sys_dlist_append(&nsos_polls, &poll->node);
-
-	nsos_adapt_poll_add(&poll->mid);
-
-	k_spin_unlock(&nsos_polls_lock, key);
-
-	/* Let other sockets use another k_poll_event */
-	(*pev)++;
-
-	signaled = 0;
-	flags = 0;
-
-	k_poll_signal_check(&poll->signal, &signaled, &flags);
-	if (!signaled) {
-		return 0;
+	if (sys_dnode_is_linked(&poll->node)) {
+		nsos_adapt_poll_remove(&poll->mid);
+		sys_dlist_remove(&poll->node);
 	}
 
-	/* Events are ready, don't wait */
-	return -EALREADY;
+	poll->mid.events = pfd->events;
+	poll->mid.revents = 0;
+	poll->mid.cb = pollcb;
+	k_poll_signal_init(&poll->signal);
+	k_poll_event_init(*pev, K_POLL_TYPE_SIGNAL, K_POLL_MODE_NOTIFY_ONLY, &poll->signal);
+	sys_dlist_append(&nsos_polls, &poll->node);
+	nsos_adapt_poll_add(&poll->mid);
+	k_spin_unlock(&nsos_polls_lock, key);
+	(*pev)++;
+
+	k_poll_signal_check(&poll->signal, &signaled, &flags);
+	return signaled != 0U ? -EALREADY : 0;
 }
 
 static int nsos_poll_update(struct nsos_socket *sock, struct zsock_pollfd *pfd,
@@ -362,8 +362,24 @@ static int nsos_poll_update(struct nsos_socket *sock, struct zsock_pollfd *pfd,
 	unsigned int signaled;
 	k_spinlock_key_t key;
 	int flags;
+	bool notified = (*pev)->state != K_POLL_STATE_NOT_READY;
 
+	(*pev)->state = K_POLL_STATE_NOT_READY;
 	(*pev)++;
+
+	/* Socket-owned registrations remain valid across poll retries. */
+	if (poll == &sock->poll) {
+		key = k_spin_lock(&nsos_polls_lock);
+		k_poll_signal_reset(&poll->signal);
+		poll->mid.revents = 0;
+		nsos_adapt_poll_remove(&poll->mid);
+		nsos_adapt_poll_update(&poll->mid);
+		pfd->revents = poll->mid.revents;
+		poll->mid.revents = 0;
+		nsos_adapt_poll_add(&poll->mid);
+		k_spin_unlock(&nsos_polls_lock, key);
+		return notified && pfd->revents == 0 ? -EAGAIN : 0;
+	}
 
 	signaled = 0;
 	flags = 0;

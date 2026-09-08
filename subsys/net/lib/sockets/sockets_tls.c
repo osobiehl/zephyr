@@ -4113,6 +4113,10 @@ static int ztls_poll_prepare_ctx(struct tls_context *ctx,
 	if ((pfd->events & ZSOCK_POLLIN) && (ctx->type == NET_SOCK_DGRAM) &&
 	    (ctx->options.role == MBEDTLS_SSL_IS_CLIENT) &&
 	    !is_handshake_complete(ctx->active_session)) {
+		if (*pev == pev_end) {
+			return -ENOMEM;
+		}
+
 		(*pev)->obj = &ctx->active_session->tls_established;
 		(*pev)->type = K_POLL_TYPE_SEM_AVAILABLE;
 		(*pev)->mode = K_POLL_MODE_NOTIFY_ONLY;
@@ -4444,6 +4448,48 @@ static int ztls_poll_update_pollin(int fd, struct tls_context *ctx,
 	return tls_update_pollin(fd, ctx, pfd);
 }
 
+static int ztls_poll_update_handshake(const struct fd_op_vtable *vtable, void *obj,
+				      struct zsock_pollfd *pfd, struct k_poll_event **pev)
+{
+	struct k_poll_event *handshake = *pev;
+	struct k_poll_event *socket_events = handshake + 1;
+	short events = pfd->events;
+	bool ready = handshake->state != K_POLL_STATE_NOT_READY;
+	int ret;
+
+	/* Update every event prepared alongside the handshake semaphore before
+	 * changing the socket's subscription. POLLIN was masked during prepare.
+	 */
+	*pev = socket_events;
+	pfd->events &= ~ZSOCK_POLLIN;
+	ret = zvfs_fdtable_call_ioctl(vtable, obj, ZFD_IOCTL_POLL_UPDATE, pfd, pev);
+	pfd->events = events;
+	if (!ready || (ret != 0 && ret != -EAGAIN)) {
+		return ret;
+	}
+
+	if (socket_events == *pev) {
+		/* Native UDP needs its first socket event only when POLLIN is
+		 * enabled. Reuse the handshake slot for that event.
+		 */
+		socket_events = handshake;
+	} else {
+		/* NSOS already has a socket event. Keep its position and disable
+		 * the completed semaphore so following descriptors stay aligned.
+		 */
+		handshake->type = K_POLL_TYPE_IGNORE;
+		handshake->state = K_POLL_STATE_NOT_READY;
+	}
+
+	ret = zvfs_fdtable_call_ioctl(vtable, obj, ZFD_IOCTL_POLL_PREPARE,
+				     pfd, &socket_events, *pev);
+	if (ret != 0 && ret != -EALREADY) {
+		return ret;
+	}
+
+	return -EAGAIN;
+}
+
 static int ztls_poll_update_ctx(struct tls_context *ctx,
 				struct zsock_pollfd *pfd,
 				struct k_poll_event **pev)
@@ -4462,33 +4508,15 @@ static int ztls_poll_update_ctx(struct tls_context *ctx,
 
 	(void)k_mutex_lock(lock, K_FOREVER);
 
-	/* Check if the socket was waiting for the handshake to complete. */
-	if ((pfd->events & ZSOCK_POLLIN) &&
+	/* A disabled handshake slot remains reserved for this poll call. */
+	if ((pfd->events & ZSOCK_POLLIN) != 0 &&
 	    ((*pev)->obj == &ctx->active_session->tls_established)) {
-		/* In case handshake is complete, reconfigure the k_poll_event
-		 * to monitor the underlying socket now.
-		 */
-		if ((*pev)->state != K_POLL_STATE_NOT_READY) {
-			ret = zvfs_fdtable_call_ioctl(vtable, obj,
-						   ZFD_IOCTL_POLL_PREPARE,
-						   pfd, pev, *pev + 1);
-			if (ret != 0 && ret != -EALREADY) {
-				goto out;
-			}
-
-			/* Return -EAGAIN to signal to poll() that it should
-			 * make another iteration with the event reconfigured
-			 * above (if needed).
-			 */
-			ret = -EAGAIN;
+		if ((*pev)->type != K_POLL_TYPE_IGNORE) {
+			ret = ztls_poll_update_handshake(vtable, obj, pfd, pev);
 			goto out;
 		}
 
-		/* Handshake still not ready - skip ZSOCK_POLLIN verification
-		 * for the underlying socket.
-		 */
 		(*pev)++;
-		pfd->events &= ~ZSOCK_POLLIN;
 	}
 
 	ret = zvfs_fdtable_call_ioctl(vtable, obj, ZFD_IOCTL_POLL_UPDATE,
